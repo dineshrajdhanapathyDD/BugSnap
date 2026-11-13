@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BugSnap</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>BugSnap</h1>
+    <span class="tagline">Serverless bug tracking</span>
+  </header>
+
+  <main>
+    <section class="stats" aria-label="Summary">
+      <div class="card"><span class="label">Total bugs</span><strong id="stat-total">-</strong></div>
+      <div class="card"><span class="label">Open</span><strong id="stat-open">-</strong></div>
+      <div class="card"><span class="label">Resolved</span><strong id="stat-resolved">-</strong></div>
+      <div class="card warn"><span class="label">High priority (active)</span><strong id="stat-high">-</strong></div>
+    </section>
+
+    <div class="grid">
+      <section class="panel" aria-labelledby="submit-h">
+        <h2 id="submit-h">Report a bug</h2>
+        <form id="bug-form" novalidate>
+          <label for="title">Title</label>
+          <input id="title" name="title" maxlength="120" required>
+
+          <label for="description">Description</label>
+          <textarea id="description" name="description" rows="4" maxlength="5000" required></textarea>
+
+          <label for="severity">Severity</label>
+          <select id="severity" name="severity" required>
+            <option value="low">Low</option>
+            <option value="medium" selected>Medium</option>
+            <option value="high">High</option>
+            <option value="critical">Critical</option>
+          </select>
+
+          <label for="screenshot">Screenshot (optional, max 5 MB)</label>
+          <input id="screenshot" type="file" accept="image/png,image/jpeg,image/gif,image/webp">
+
+          <button type="submit" id="submit-btn">Submit bug</button>
+          <p id="form-msg" role="status" aria-live="polite"></p>
+        </form>
+
+        <h3>Workflow execution</h3>
+        <div id="workflow" class="workflow" aria-live="polite">
+          <p class="muted">Submit a bug to see the Step Functions workflow result.</p>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="list-h">
+        <div class="list-head">
+          <h2 id="list-h">Bugs</h2>
+          <div class="filters">
+            <label for="f-severity" class="sr-only">Filter by severity</label>
+            <select id="f-severity">
+              <option value="">All severities</option>
+              <option value="critical">Critical</option>
+              <option value="high">High</option>
+              <option value="medium">Medium</option>
+              <option value="low">Low</option>
+            </select>
+            <label for="f-status" class="sr-only">Filter by status</label>
+            <select id="f-status">
+              <option value="">All statuses</option>
+              <option value="open">Open</option>
+              <option value="in_progress">In progress</option>
+              <option value="resolved">Resolved</option>
+              <option value="closed">Closed</option>
+            </select>
+            <button type="button" id="refresh-btn" class="secondary">Refresh</button>
+          </div>
+        </div>
+        <p id="list-msg" role="status" aria-live="polite" class="muted"></p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Title</th><th>Severity</th><th>Priority</th><th>Status</th><th>Created</th></tr>
+            </thead>
+            <tbody id="bug-rows"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

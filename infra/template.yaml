@@ -1,0 +1,900 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: BugSnap - serverless bug tracking with S3, API Gateway, Lambda, DynamoDB, Step Functions and CloudWatch.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: bugsnap
+    AllowedPattern: "^[a-z0-9-]{3,20}$"
+    Description: Lowercase prefix used in resource names.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+Resources:
+  # ------------------------------------------------------------------ Storage
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppName}-frontend-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt FrontendBucket.Arn
+              - !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AppName}-oac-${AWS::AccountId}"
+        Description: Lets CloudFront read the private frontend bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AppName} frontend"
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: frontend
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+          # Managed policies: CachingOptimized and SecurityHeadersPolicy
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+
+  AttachmentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppName}-attachments-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT, GET]
+            AllowedOrigins: [!Sub "https://${Distribution.DomainName}"]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+
+  AttachmentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AttachmentBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt AttachmentBucket.Arn
+              - !Sub "${AttachmentBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  BugsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-Bugs"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: bug_id, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: severity, AttributeType: S }
+        - { AttributeName: created_at, AttributeType: S }
+      KeySchema:
+        - AttributeName: bug_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: status-created_at-index
+          KeySchema:
+            - { AttributeName: status, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: severity-created_at-index
+          KeySchema:
+            - { AttributeName: severity, KeyType: HASH }
+            - { AttributeName: created_at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # --------------------------------------------------------------- Log groups
+  ValidateBugLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-ValidateBug"
+      RetentionInDays: !Ref LogRetentionDays
+  SaveBugLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-SaveBug"
+      RetentionInDays: !Ref LogRetentionDays
+  PrioritizeBugLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-PrioritizeBug"
+      RetentionInDays: !Ref LogRetentionDays
+  CreateBugLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-CreateBug"
+      RetentionInDays: !Ref LogRetentionDays
+  GetBugsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-GetBugs"
+      RetentionInDays: !Ref LogRetentionDays
+  GetBugLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-GetBug"
+      RetentionInDays: !Ref LogRetentionDays
+  UpdateBugLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-UpdateBug"
+      RetentionInDays: !Ref LogRetentionDays
+  GetUploadUrlLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AppName}-GetUploadUrl"
+      RetentionInDays: !Ref LogRetentionDays
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/vendedlogs/states/${AppName}-BugWorkflow"
+      RetentionInDays: !Ref LogRetentionDays
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AppName}-access"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ------------------------------------------------------------- IAM (Lambda)
+  ValidateBugRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: { Version: "2012-10-17", Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: "sts:AssumeRole" }] }
+      Policies:
+        - PolicyName: logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ValidateBugLogGroup.Arn}:*"
+
+  SaveBugRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: { Version: "2012-10-17", Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: "sts:AssumeRole" }] }
+      Policies:
+        - PolicyName: access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${SaveBugLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt BugsTable.Arn
+
+  PrioritizeBugRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: { Version: "2012-10-17", Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: "sts:AssumeRole" }] }
+      Policies:
+        - PolicyName: access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${PrioritizeBugLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt BugsTable.Arn
+
+  CreateBugRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: { Version: "2012-10-17", Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: "sts:AssumeRole" }] }
+      Policies:
+        - PolicyName: access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${CreateBugLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: states:StartSyncExecution
+                Resource: !Ref BugWorkflow
+
+  GetBugsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: { Version: "2012-10-17", Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: "sts:AssumeRole" }] }
+      Policies:
+        - PolicyName: access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${GetBugsLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource:
+                  - !GetAtt BugsTable.Arn
+                  - !Sub "${BugsTable.Arn}/index/*"
+
+  GetBugRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: { Version: "2012-10-17", Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: "sts:AssumeRole" }] }
+      Policies:
+        - PolicyName: access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${GetBugLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt BugsTable.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${AttachmentBucket.Arn}/screenshots/*"
+
+  UpdateBugRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: { Version: "2012-10-17", Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: "sts:AssumeRole" }] }
+      Policies:
+        - PolicyName: access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${UpdateBugLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt BugsTable.Arn
+
+  GetUploadUrlRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: { Version: "2012-10-17", Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: "sts:AssumeRole" }] }
+      Policies:
+        - PolicyName: access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${GetUploadUrlLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${AttachmentBucket.Arn}/screenshots/*"
+
+  # ---------------------------------------------------------------- Functions
+  ValidateBugFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ValidateBugLogGroup
+    Properties:
+      FunctionName: !Sub "${AppName}-ValidateBug"
+      Runtime: python3.13
+      Handler: validate_bug.handler
+      Code: ../lambda/src
+      Role: !GetAtt ValidateBugRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables: { LOG_LEVEL: INFO }
+
+  SaveBugFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SaveBugLogGroup
+    Properties:
+      FunctionName: !Sub "${AppName}-SaveBug"
+      Runtime: python3.13
+      Handler: save_bug.handler
+      Code: ../lambda/src
+      Role: !GetAtt SaveBugRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables: { TABLE_NAME: !Ref BugsTable, LOG_LEVEL: INFO }
+
+  PrioritizeBugFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PrioritizeBugLogGroup
+    Properties:
+      FunctionName: !Sub "${AppName}-PrioritizeBug"
+      Runtime: python3.13
+      Handler: prioritize_bug.handler
+      Code: ../lambda/src
+      Role: !GetAtt PrioritizeBugRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables: { TABLE_NAME: !Ref BugsTable, LOG_LEVEL: INFO }
+
+  CreateBugFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CreateBugLogGroup
+    Properties:
+      FunctionName: !Sub "${AppName}-CreateBug"
+      Runtime: python3.13
+      Handler: create_bug.handler
+      Code: ../lambda/src
+      Role: !GetAtt CreateBugRole.Arn
+      Timeout: 29
+      MemorySize: 128
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref BugWorkflow
+          ALLOWED_ORIGIN: !Sub "https://${Distribution.DomainName}"
+          LOG_LEVEL: INFO
+
+  GetBugsFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: GetBugsLogGroup
+    Properties:
+      FunctionName: !Sub "${AppName}-GetBugs"
+      Runtime: python3.13
+      Handler: get_bugs.handler
+      Code: ../lambda/src
+      Role: !GetAtt GetBugsRole.Arn
+      Timeout: 20
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref BugsTable
+          ALLOWED_ORIGIN: !Sub "https://${Distribution.DomainName}"
+          LOG_LEVEL: INFO
+
+  GetBugFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: GetBugLogGroup
+    Properties:
+      FunctionName: !Sub "${AppName}-GetBug"
+      Runtime: python3.13
+      Handler: get_bug.handler
+      Code: ../lambda/src
+      Role: !GetAtt GetBugRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref BugsTable
+          ATTACHMENT_BUCKET: !Ref AttachmentBucket
+          ALLOWED_ORIGIN: !Sub "https://${Distribution.DomainName}"
+          LOG_LEVEL: INFO
+
+  UpdateBugFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: UpdateBugLogGroup
+    Properties:
+      FunctionName: !Sub "${AppName}-UpdateBug"
+      Runtime: python3.13
+      Handler: update_bug.handler
+      Code: ../lambda/src
+      Role: !GetAtt UpdateBugRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref BugsTable
+          ALLOWED_ORIGIN: !Sub "https://${Distribution.DomainName}"
+          LOG_LEVEL: INFO
+
+  GetUploadUrlFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: GetUploadUrlLogGroup
+    Properties:
+      FunctionName: !Sub "${AppName}-GetUploadUrl"
+      Runtime: python3.13
+      Handler: get_upload_url.handler
+      Code: ../lambda/src
+      Role: !GetAtt GetUploadUrlRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          ATTACHMENT_BUCKET: !Ref AttachmentBucket
+          ALLOWED_ORIGIN: !Sub "https://${Distribution.DomainName}"
+          LOG_LEVEL: INFO
+
+  # ------------------------------------------------------------ Step Functions
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: workflow
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ValidateBugFunction.Arn
+                  - !GetAtt SaveBugFunction.Arn
+                  - !GetAtt PrioritizeBugFunction.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+  BugWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AppName}-BugWorkflow"
+      StateMachineType: EXPRESS
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      DefinitionString: !Sub
+            - |
+              {
+                "Comment": "BugSnap submission workflow: validate -> save -> prioritize",
+                "QueryLanguage": "JSONata",
+                "StartAt": "ValidateBug",
+                "States": {
+                  "ValidateBug": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Arguments": {
+                      "FunctionName": "${ValidateArn}",
+                      "Payload": "{% $states.input %}"
+                    },
+                    "Output": "{% $states.result.Payload %}",
+                    "Retry": [{
+                      "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                      "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2
+                    }],
+                    "Catch": [{ "ErrorEquals": ["States.ALL"], "Output": "{% $states.errorOutput %}", "Next": "WorkflowFailed" }],
+                    "Next": "IsValid"
+                  },
+                  "IsValid": {
+                    "Type": "Choice",
+                    "Choices": [{ "Condition": "{% $states.input.valid = true %}", "Next": "SaveBug" }],
+                    "Default": "ValidationFailed"
+                  },
+                  "ValidationFailed": {
+                    "Type": "Fail",
+                    "Error": "ValidationFailed",
+                    "Cause": "{% $string($states.input.errors) %}"
+                  },
+                  "SaveBug": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Arguments": {
+                      "FunctionName": "${SaveArn}",
+                      "Payload": "{% $states.input %}"
+                    },
+                    "Output": "{% $states.result.Payload %}",
+                    "Retry": [{
+                      "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                      "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2
+                    }],
+                    "Catch": [{ "ErrorEquals": ["States.ALL"], "Output": "{% $states.errorOutput %}", "Next": "WorkflowFailed" }],
+                    "Next": "PrioritizeBug"
+                  },
+                  "PrioritizeBug": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Arguments": {
+                      "FunctionName": "${PrioritizeArn}",
+                      "Payload": "{% $states.input %}"
+                    },
+                    "Output": "{% $states.result.Payload %}",
+                    "Retry": [{
+                      "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                      "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2
+                    }],
+                    "Catch": [{ "ErrorEquals": ["States.ALL"], "Output": "{% $states.errorOutput %}", "Next": "WorkflowFailed" }],
+                    "Next": "BuildResult"
+                  },
+                  "BuildResult": {
+                    "Type": "Pass",
+                    "Output": {
+                      "bug_id": "{% $states.input.bug_id %}",
+                      "priority": "{% $states.input.priority %}",
+                      "severity": "{% $states.input.severity %}",
+                      "workflow_status": "COMPLETED"
+                    },
+                    "End": true
+                  },
+                  "WorkflowFailed": {
+                    "Type": "Fail",
+                    "Error": "WorkflowFailed",
+                    "Cause": "{% $string($states.input) %}"
+                  }
+                }
+              }
+            - ValidateArn: !GetAtt ValidateBugFunction.Arn
+              SaveArn: !GetAtt SaveBugFunction.Arn
+              PrioritizeArn: !GetAtt PrioritizeBugFunction.Arn
+
+  # -------------------------------------------------------------- API Gateway
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AppName}-api"
+      Description: BugSnap REST API
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  # CORS headers on gateway-generated errors (401/403/429/5xx) so the browser can read them
+  Default4xxResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref Api
+      ResponseType: DEFAULT_4XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: !Sub "'https://${Distribution.DomainName}'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type'"
+  Default5xxResponse:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref Api
+      ResponseType: DEFAULT_5XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: !Sub "'https://${Distribution.DomainName}'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type'"
+
+  BugsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: bugs
+
+  BugResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !Ref BugsResource
+      PathPart: "{id}"
+
+  UploadsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: uploads
+
+  PostBugsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref BugsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateBugFunction.Arn}/invocations"
+
+  GetBugsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref BugsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetBugsFunction.Arn}/invocations"
+
+  GetBugMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref BugResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetBugFunction.Arn}/invocations"
+
+  PatchBugMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref BugResource
+      HttpMethod: PATCH
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UpdateBugFunction.Arn}/invocations"
+
+  PostUploadsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref UploadsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetUploadUrlFunction.Arn}/invocations"
+
+  # CORS preflight (mock integrations)
+  BugsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref BugsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode": 200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${Distribution.DomainName}'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  BugOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref BugResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode": 200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${Distribution.DomainName}'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,PATCH,OPTIONS'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  UploadsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref UploadsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates: { application/json: '{"statusCode": 200}' }
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${Distribution.DomainName}'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - Default4xxResponse
+      - Default5xxResponse
+      - PostBugsMethod
+      - GetBugsMethod
+      - GetBugMethod
+      - PatchBugMethod
+      - PostUploadsMethod
+      - BugsOptionsMethod
+      - BugOptionsMethod
+      - UploadsOptionsMethod
+    Properties:
+      RestApiId: !Ref Api
+      Description: BugSnap API deployment (deploy.ps1 suffixes this logical ID with a content hash so changes are republished)
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref Api
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          ThrottlingRateLimit: 20
+          ThrottlingBurstLimit: 40
+      # Uses the account-level API Gateway CloudWatch role that already exists in
+      # this account/region. This template intentionally does not create
+      # AWS::ApiGateway::Account so it does not take over that setting.
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status","latency":"$context.responseLatency"}'
+
+  CreateBugPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CreateBugFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/POST/bugs"
+  GetBugsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GetBugsFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/GET/bugs"
+  GetBugPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GetBugFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/GET/bugs/*"
+  UpdateBugPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UpdateBugFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/PATCH/bugs/*"
+  GetUploadUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GetUploadUrlFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/POST/uploads"
+
+  # -------------------------------------------------------------- Monitoring
+  WorkflowFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AppName}-workflow-failures"
+      AlarmDescription: Bug workflow executions failed unexpectedly.
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref BugWorkflow
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AppName}-api-5xx"
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "${AppName}-api"
+        - Name: Stage
+          Value: prod
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}"
+  WebsiteUrl:
+    Value: !Sub "https://${Distribution.DomainName}"
+  DistributionId:
+    Value: !Ref Distribution
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  AttachmentBucketName:
+    Value: !Ref AttachmentBucket
+  TableName:
+    Value: !Ref BugsTable
+  StateMachineArn:
+    Value: !Ref BugWorkflow
