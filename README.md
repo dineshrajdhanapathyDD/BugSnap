@@ -28,7 +28,6 @@ Small teams lose bug reports in chat threads and need a place to submit, priorit
 frontend/             HTML/CSS/JS dashboard (config.js is generated at deploy time)
 lambda/src/           Python Lambda functions (+ common.py)
 infra/template.yaml   CloudFormation template (everything, including the state machine)
-scripts/              deploy.ps1, cleanup.ps1
 tests/e2e_test.py     end-to-end tests against the deployed stack
 docs/                 architecture (drawio, png, md), API reference, cost analysis, findings, article, video script
 docs/screenshot/      dashboard, workflow and AWS console screenshots

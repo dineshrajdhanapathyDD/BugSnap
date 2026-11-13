@@ -16,6 +16,10 @@ Rules from the submission requirements:
 5. Warm up the Lambdas by submitting one bug a minute before recording. After idle time the first run takes about 2.5 seconds because of a cold start; a warm run is about 0.4 to 0.6 seconds.
 5. Set the browser zoom so text is readable at 1080p. Close notifications.
 
+## Scripted base clip (optional)
+
+`python scripts/record_demo.py` records a silent 58-second clip of the dashboard against the live stack to `demo-video/bugsnap-dashboard-demo.webm` (1440x900, on-screen captions, no audio). It warms the Lambdas first and deletes the bugs it creates, so your table is unchanged. It covers the first 1:45 of the script below: the failed submission, the successful one with a screenshot, the status change, and the filters. Add your narration in Clipchamp, then record or add the AWS console parts (Step Functions Executions, CloudWatch, CloudFormation) yourself. Pass `--keep` to leave the demo bug in the table. The `demo-video/` folder is git-ignored.
+
 ## Script
 
 | Time | On screen | Say |
